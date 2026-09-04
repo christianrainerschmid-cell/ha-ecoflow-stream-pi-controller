@@ -423,6 +423,59 @@ This keeps the actual EcoFlow entity IDs in one place.
 
 The controller automation calls only these scripts.
 
+## Actuator write behaviour
+
+Every value sent to the EcoFlow device goes through one of the four `efctrl_set_*` scripts. The controller already avoids unnecessary writes:
+
+- charge limit and base load are written only when `|target - current| >= step`
+- inside the deadband the setpoint does not change, so nothing is written
+- energy strategy and backup reserve are written only on an actual state change
+
+### Write counters
+
+These counters increment only when a value is actually sent to the device:
+
+```text
+counter.efctrl_writes_charge
+counter.efctrl_writes_discharge
+counter.efctrl_writes_backup_reserve
+counter.efctrl_writes_strategy
+sensor.efctrl_actuator_writes_total
+```
+
+They are cumulative and are never reset automatically. To measure your own write rate, note the total, wait a few days and divide by the number of days.
+
+### Write rate limit
+
+```text
+input_number.ecoflow_unified_min_write_interval
+```
+
+Minimum number of seconds between two writes to the same actuator entity.
+
+```text
+0        = disabled (default, original behaviour)
+10 - 20  = reasonable setting to reduce device parameter writes
+```
+
+The rate limit is deliberately bypassed for:
+
+- stop commands (`value: 0`)
+- calls with `force: true` (mode transitions, e.g. EV support)
+- energy strategy and backup reserve, which are state-change writes only
+
+A suppressed write is retried on the next control cycle. Because the PI controller is incremental and re-reads the current EcoFlow output every cycle, no correction is lost — it is only deferred.
+
+The last write timestamp is stored in `input_datetime.efctrl_last_write_*`. A script's own `last_triggered` attribute cannot be used for this, because Home Assistant sets it when the script starts, which would make the script block its own call.
+
+### Note on non-volatile memory
+
+EcoFlow's firmware is closed-source, so it is not known whether BLE parameter updates are held in RAM or committed to flash on every write. The parameters do survive a power cycle, so they reach non-volatile storage at some point.
+
+The worst case can be ruled out empirically: at a 5 s loop, unbuffered writes would exhaust a 10k-cycle flash within days, and STREAM devices have been controlled at these intervals for well over a year without reports of failures. The counters above let you replace this reasoning with an actual measurement for your own system.
+
+If you want to reduce writes further, the largest single factor is `Charge Step`. The default of 1 W makes the charge branch write on nearly every tick when PV output fluctuates; 10-25 W reduces this substantially at very little cost in control quality.
+
 ## Testing checklist
 
 Before enabling the controller:
