@@ -870,9 +870,12 @@ input_number:
     step: 1
     unit_of_measurement: "s"
     mode: box
-    # 0 = disabled, keeps the original control behaviour unchanged.
-    # 10-20 s is a reasonable setting to reduce device parameter writes.
-    initial: 0
+    # No `initial:` on purpose: Home Assistant re-applies `initial` on every
+    # restart (not just on first creation), which would silently reset a
+    # user-configured interval back to 0 after each restart. Without it,
+    # the value you set in the UI is restored across restarts; only the
+    # very first start defaults to `min` (0 = disabled, unchanged
+    # out-of-the-box behaviour).
 
 ###############################################################################
 # ACTUATOR WRITE TRACKING

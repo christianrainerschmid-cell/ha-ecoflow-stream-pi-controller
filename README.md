@@ -468,6 +468,26 @@ A suppressed write is retried on the next control cycle. Because the PI controll
 
 The last write timestamp is stored in `input_datetime.efctrl_last_write_*`. A script's own `last_triggered` attribute cannot be used for this, because Home Assistant sets it when the script starts, which would make the script block its own call.
 
+### Recorder impact
+
+Every actual device write now also updates an `input_datetime.efctrl_last_write_*` helper, a `counter.efctrl_writes_*`, and recalculates `sensor.efctrl_actuator_writes_total`. By default Home Assistant's recorder stores all state changes, so each real actuator write turns into roughly four recorder rows instead of one.
+
+This scales with how often the controller actually writes to the device, not with the 5 s control-loop tick — the deadband, step sizes and (if configured) `ecoflow_unified_min_write_interval` all still apply before a write happens. On the tested setup this stayed at a handful of writes per minute at most, but on a noisier PV/grid signal or with the rate limit left at `0` it can add up over time.
+
+The `counter.efctrl_writes_*` entities and `sensor.efctrl_actuator_writes_total` are intentionally kept in recorder history, since tracking your own write rate over days is the whole point of the counters (see above). The four `input_datetime.efctrl_last_write_*` helpers, on the other hand, only exist internally for the rate-limit guard and have no value in the history graph — they are the best candidate to exclude if you want to cut the extra recorder traffic:
+
+```yaml
+recorder:
+  exclude:
+    entities:
+      - input_datetime.efctrl_last_write_charge
+      - input_datetime.efctrl_last_write_discharge
+      - input_datetime.efctrl_last_write_backup_reserve
+      - input_datetime.efctrl_last_write_strategy
+```
+
+If your `recorder:` config does not exist yet, add the block above as-is; if it already excludes other entities, add these four to your existing `exclude.entities` list instead of creating a second `recorder:` key.
+
 ### Note on non-volatile memory
 
 EcoFlow's firmware is closed-source, so it is not known whether BLE parameter updates are held in RAM or committed to flash on every write. The parameters do survive a power cycle, so they reach non-volatile storage at some point.
