@@ -514,6 +514,17 @@ template:
             0
           {% endif %}
 
+      - name: "EFCTRL Actuator Writes Total"
+        unique_id: efctrl_actuator_writes_total
+        unit_of_measurement: "writes"
+        state: >
+          {{
+            (states('counter.efctrl_writes_charge') | int(0))
+            + (states('counter.efctrl_writes_discharge') | int(0))
+            + (states('counter.efctrl_writes_backup_reserve') | int(0))
+            + (states('counter.efctrl_writes_strategy') | int(0))
+          }}
+
 ###############################################################################
 # SCRIPTS / ACTUATOR ADAPTERS
 #
@@ -521,61 +532,168 @@ template:
 ###############################################################################
 
 script:
+  ###########################################################################
+  # Actuator scripts
+  #
+  # These are the only places where a value is written to the EcoFlow device.
+  #
+  # Write rate limit:
+  #   input_number.ecoflow_unified_min_write_interval defines the minimum
+  #   number of seconds between two writes to the SAME actuator entity.
+  #   Default is 0 = disabled, so the out-of-the-box control behaviour is
+  #   unchanged. A value of 10-20 s is a reasonable setting if you want to
+  #   reduce the number of parameter writes to the device.
+  #
+  #   The rate limit is deliberately bypassed for:
+  #     - stop commands (value 0)
+  #     - calls with force: true (mode transitions)
+  #     - energy strategy and backup reserve (state-change writes only)
+  #
+  #   The last write timestamp is kept in a dedicated input_datetime helper.
+  #   The script's own last_triggered attribute cannot be used for this,
+  #   because Home Assistant updates it when the script starts, which would
+  #   make the script block its own call.
+  #
+  # Write counters:
+  #   counter.efctrl_writes_* count the actual writes sent to the device.
+  #   They are cumulative and are never reset automatically.
+  ###########################################################################
+
   efctrl_set_charge_power:
     alias: EFCTRL Set Charge Power
     mode: queued
+    max: 10
     fields:
       value:
         description: Charge power in W
         example: 500
+      force:
+        description: Bypass the write rate limit (mode transitions)
+        example: true
+    variables:
+      min_write_interval: "{{ states('input_number.ecoflow_unified_min_write_interval') | float(0) }}"
+      last_write_ts: "{{ state_attr('input_datetime.efctrl_last_write_charge', 'timestamp') | float(0) }}"
+      write_forced: "{{ force | default(false) | bool(false) }}"
+      write_is_stop: "{{ value | int(0) == 0 }}"
     sequence:
+      - condition: template
+        value_template: >
+          {{
+            write_forced
+            or write_is_stop
+            or min_write_interval <= 0
+            or (now().timestamp() - last_write_ts) >= min_write_interval
+          }}
+
       - service: number.set_value
         target:
           entity_id: number.your_ecoflow_charging_power_limit
         data:
           value: "{{ value | int(0) }}"
 
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.efctrl_last_write_charge
+        data:
+          timestamp: "{{ now().timestamp() }}"
+
+      - service: counter.increment
+        target:
+          entity_id: counter.efctrl_writes_charge
+
   efctrl_set_discharge_power:
     alias: EFCTRL Set Discharge Power
     mode: queued
+    max: 10
     fields:
       value:
         description: Discharge / base-load power in W
         example: 300
+      force:
+        description: Bypass the write rate limit (mode transitions)
+        example: true
+    variables:
+      min_write_interval: "{{ states('input_number.ecoflow_unified_min_write_interval') | float(0) }}"
+      last_write_ts: "{{ state_attr('input_datetime.efctrl_last_write_discharge', 'timestamp') | float(0) }}"
+      write_forced: "{{ force | default(false) | bool(false) }}"
+      write_is_stop: "{{ value | int(0) == 0 }}"
     sequence:
+      - condition: template
+        value_template: >
+          {{
+            write_forced
+            or write_is_stop
+            or min_write_interval <= 0
+            or (now().timestamp() - last_write_ts) >= min_write_interval
+          }}
+
       - service: number.set_value
         target:
           entity_id: number.your_ecoflow_base_load_power
         data:
           value: "{{ value | int(0) }}"
 
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.efctrl_last_write_discharge
+        data:
+          timestamp: "{{ now().timestamp() }}"
+
+      - service: counter.increment
+        target:
+          entity_id: counter.efctrl_writes_discharge
+
   efctrl_set_backup_reserve:
     alias: EFCTRL Set Backup Reserve
     mode: queued
+    max: 10
     fields:
       value:
         description: Backup reserve in percent
         example: 20
     sequence:
+      # Not rate limited: only written on an actual state change.
       - service: number.set_value
         target:
           entity_id: number.your_ecoflow_backup_reserve
         data:
           value: "{{ value | int(0) }}"
 
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.efctrl_last_write_backup_reserve
+        data:
+          timestamp: "{{ now().timestamp() }}"
+
+      - service: counter.increment
+        target:
+          entity_id: counter.efctrl_writes_backup_reserve
+
   efctrl_set_energy_strategy:
     alias: EFCTRL Set Energy Strategy
     mode: queued
+    max: 10
     fields:
       option:
         description: EcoFlow energy strategy option
         example: self_powered
     sequence:
+      # Not rate limited: mode transitions must never be delayed.
       - service: select.select_option
         target:
           entity_id: select.your_ecoflow_energy_strategy
         data:
           option: "{{ option }}"
+
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.efctrl_last_write_strategy
+        data:
+          timestamp: "{{ now().timestamp() }}"
+
+      - service: counter.increment
+        target:
+          entity_id: counter.efctrl_writes_strategy
 
 ###############################################################################
 # HELPERS
@@ -744,6 +862,74 @@ input_number:
     unit_of_measurement: "W"
     mode: box
     initial: 80
+
+  ecoflow_unified_min_write_interval:
+    name: EcoFlow Unified Min Write Interval
+    min: 0
+    max: 120
+    step: 1
+    unit_of_measurement: "s"
+    mode: box
+    # No `initial:` on purpose: Home Assistant re-applies `initial` on every
+    # restart (not just on first creation), which would silently reset a
+    # user-configured interval back to 0 after each restart. Without it,
+    # the value you set in the UI is restored across restarts; only the
+    # very first start defaults to `min` (0 = disabled, unchanged
+    # out-of-the-box behaviour).
+
+###############################################################################
+# ACTUATOR WRITE TRACKING
+#
+# input_datetime helpers hold the timestamp of the last write per actuator.
+# A script's own last_triggered attribute cannot be used for this, because
+# Home Assistant sets it when the script starts.
+#
+# counter helpers count the writes actually sent to the device. They are
+# cumulative. To measure the write rate, note the value, wait a few days and
+# divide by the number of days.
+###############################################################################
+
+input_datetime:
+  efctrl_last_write_charge:
+    name: EFCTRL Last Write Charge Power
+    has_date: true
+    has_time: true
+
+  efctrl_last_write_discharge:
+    name: EFCTRL Last Write Discharge Power
+    has_date: true
+    has_time: true
+
+  efctrl_last_write_backup_reserve:
+    name: EFCTRL Last Write Backup Reserve
+    has_date: true
+    has_time: true
+
+  efctrl_last_write_strategy:
+    name: EFCTRL Last Write Energy Strategy
+    has_date: true
+    has_time: true
+
+counter:
+  efctrl_writes_charge:
+    name: EFCTRL Writes Charge Power
+    icon: mdi:counter
+    step: 1
+
+  efctrl_writes_discharge:
+    name: EFCTRL Writes Discharge Power
+    icon: mdi:counter
+    step: 1
+
+  efctrl_writes_backup_reserve:
+    name: EFCTRL Writes Backup Reserve
+    icon: mdi:counter
+    step: 1
+
+  efctrl_writes_strategy:
+    name: EFCTRL Writes Energy Strategy
+    icon: mdi:counter
+    step: 1
 
 ###############################################################################
 # FILTER / ENERGY SENSORS
@@ -1121,6 +1307,7 @@ automation:
                   - service: script.efctrl_set_discharge_power
                     data:
                       value: "{{ ev_discharge_power | int(800) }}"
+                      force: true
 
           #####################################################################
           # Charge blocked: stop charging only, keep discharge untouched
